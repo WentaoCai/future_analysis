@@ -259,3 +259,186 @@ DataFrame calc_backgrounds_cpp(IntegerVector chr, NumericVector BPcum) {
     Named("xmax") = xmaxs
   );
 }
+
+// =============================================================================
+// Gene Annotation Functions
+// =============================================================================
+
+//' Find nearest gene for each SNP (C++ optimized)
+//' @param snp_chr SNP chromosome numbers
+//' @param snp_bp SNP base pair positions
+//' @param gene_chr Gene chromosome numbers
+//' @param gene_start Gene start positions
+//' @param gene_end Gene end positions
+//' @param gene_names Gene names
+//' @export
+// [[Rcpp::export]]
+DataFrame find_nearest_genes_cpp(IntegerVector snp_chr,
+                                 NumericVector snp_bp,
+                                 IntegerVector gene_chr,
+                                 NumericVector gene_start,
+                                 NumericVector gene_end,
+                                 CharacterVector gene_names) {
+  int n_snps = snp_chr.size();
+  int n_genes = gene_chr.size();
+
+  CharacterVector nearest_genes(n_snps);
+  NumericVector distances(n_snps);
+
+  // Build chromosome-based index for genes
+  std::unordered_map<int, std::vector<int>> chr_to_genes;
+  for(int i = 0; i < n_genes; i++) {
+    chr_to_genes[gene_chr[i]].push_back(i);
+  }
+
+  // For each SNP, find nearest gene on same chromosome
+  for(int i = 0; i < n_snps; i++) {
+    int chr = snp_chr[i];
+    double pos = snp_bp[i];
+
+    if(chr_to_genes.find(chr) == chr_to_genes.end()) {
+      nearest_genes[i] = NA_STRING;
+      distances[i] = NA_REAL;
+      continue;
+    }
+
+    double min_dist = R_PosInf;
+    int nearest_idx = -1;
+
+    // Check all genes on this chromosome
+    for(int gene_idx : chr_to_genes[chr]) {
+      double dist;
+
+      // Calculate distance to gene
+      if(pos < gene_start[gene_idx]) {
+        // SNP is upstream
+        dist = gene_start[gene_idx] - pos;
+      } else if(pos > gene_end[gene_idx]) {
+        // SNP is downstream
+        dist = pos - gene_end[gene_idx];
+      } else {
+        // SNP is within gene
+        dist = 0.0;
+      }
+
+      if(dist < min_dist) {
+        min_dist = dist;
+        nearest_idx = gene_idx;
+      }
+    }
+
+    if(nearest_idx >= 0) {
+      nearest_genes[i] = gene_names[nearest_idx];
+      distances[i] = min_dist;
+    } else {
+      nearest_genes[i] = NA_STRING;
+      distances[i] = NA_REAL;
+    }
+  }
+
+  return DataFrame::create(
+    Named("nearest_gene") = nearest_genes,
+    Named("distance") = distances
+  );
+}
+
+//' Identify QTL regions (clusters of significant SNPs)
+//' @param chr Chromosome numbers
+//' @param bp Base pair positions
+//' @param p P-values
+//' @param p_threshold Significance threshold (default 1e-5)
+//' @param merge_distance Max distance to merge nearby QTLs (default 1Mb)
+//' @export
+// [[Rcpp::export]]
+DataFrame identify_qtl_regions_cpp(IntegerVector chr,
+                                   NumericVector bp,
+                                   NumericVector p,
+                                   double p_threshold = 1e-5,
+                                   double merge_distance = 1e6) {
+  int n = chr.size();
+
+  // Find significant SNPs
+  std::vector<int> sig_indices;
+  for(int i = 0; i < n; i++) {
+    if(!NumericVector::is_na(p[i]) && p[i] < p_threshold) {
+      sig_indices.push_back(i);
+    }
+  }
+
+  if(sig_indices.empty()) {
+    // No significant SNPs
+    return DataFrame::create(
+      Named("Chr") = IntegerVector(),
+      Named("start") = NumericVector(),
+      Named("end") = NumericVector(),
+      Named("lead_snp_idx") = IntegerVector(),
+      Named("lead_snp_p") = NumericVector()
+    );
+  }
+
+  // Sort by chromosome and position
+  std::sort(sig_indices.begin(), sig_indices.end(),
+            [&](int a, int b) {
+              if(chr[a] != chr[b]) return chr[a] < chr[b];
+              return bp[a] < bp[b];
+            });
+
+  // Merge nearby significant SNPs into QTL regions
+  std::vector<int> qtl_chr;
+  std::vector<double> qtl_start, qtl_end;
+  std::vector<int> lead_snp_idx;
+  std::vector<double> lead_snp_p;
+
+  int current_chr = chr[sig_indices[0]];
+  double current_start = bp[sig_indices[0]];
+  double current_end = bp[sig_indices[0]];
+  int current_lead_idx = sig_indices[0];
+  double current_min_p = p[sig_indices[0]];
+
+  for(size_t i = 1; i < sig_indices.size(); i++) {
+    int idx = sig_indices[i];
+
+    // Check if this SNP should be merged with current region
+    if(chr[idx] == current_chr && bp[idx] - current_end <= merge_distance) {
+      // Extend current region
+      current_end = bp[idx];
+
+      // Update lead SNP if this one is more significant
+      if(p[idx] < current_min_p) {
+        current_lead_idx = idx;
+        current_min_p = p[idx];
+      }
+    } else {
+      // Save current region
+      qtl_chr.push_back(current_chr);
+      qtl_start.push_back(current_start);
+      qtl_end.push_back(current_end);
+      lead_snp_idx.push_back(current_lead_idx);
+      lead_snp_p.push_back(current_min_p);
+
+      // Start new region
+      current_chr = chr[idx];
+      current_start = bp[idx];
+      current_end = bp[idx];
+      current_lead_idx = idx;
+      current_min_p = p[idx];
+    }
+  }
+
+  // Save last region
+  qtl_chr.push_back(current_chr);
+  qtl_start.push_back(current_start);
+  qtl_end.push_back(current_end);
+  lead_snp_idx.push_back(current_lead_idx);
+  lead_snp_p.push_back(current_min_p);
+
+  Rcpp::Rcout << "Identified " << qtl_chr.size() << " QTL regions\n";
+
+  return DataFrame::create(
+    Named("Chr") = wrap(qtl_chr),
+    Named("start") = wrap(qtl_start),
+    Named("end") = wrap(qtl_end),
+    Named("lead_snp_idx") = wrap(lead_snp_idx),
+    Named("lead_snp_p") = wrap(lead_snp_p)
+  );
+}
