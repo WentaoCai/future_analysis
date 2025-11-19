@@ -244,6 +244,9 @@ plot_manhattan_with_genes <- function(
     qtl_regions$BPcum <- lead_snps$BPcum
     qtl_regions$log10p <- lead_snps$log10p
 
+    # Convert to data.table for easier manipulation
+    setDT(qtl_regions)
+
     # Filter out regions without gene annotations
     qtl_regions <- qtl_regions[!is.na(gene_name)]
 
